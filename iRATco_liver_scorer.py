@@ -10,7 +10,7 @@ from skimage import morphology, segmentation, feature, measure
 # =========================================================
 st.set_page_config(page_title="iRATco Liver Cell Boundary", layout="wide")
 st.title("iRATco Liver Cell Boundary")
-st.caption("Upload histopathology liver image to generate hepatocyte boundaries and estimate vacuolization from white spots inside each segmented object")
+st.caption("Upload histopathology liver image to generate hepatocyte boundaries and estimate vacuolization from bright area versus dense area in each segmented object")
 
 # =========================================================
 # HELPERS
@@ -57,20 +57,16 @@ def make_overlay(rgb, boundaries, boundary_color=(255, 255, 0)):
     overlay[boundaries] = boundary_color
     return overlay
 
-def calculate_vacuolization_per_object(rgb, labeled):
-    """
-    Menghitung white spot percentage per objek segmentasi.
-    White spot didefinisikan sebagai piksel terang dan saturasi rendah.
-    """
+def compute_bright_dense_metrics(rgb, labeled, bright_v_thresh, bright_s_thresh, dense_v_thresh, dense_s_thresh):
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    props = measure.regionprops(labeled)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
+    props = measure.regionprops(labeled)
     records = []
 
     for prop in props:
         label_id = int(prop.label)
         area = int(prop.area)
-
         if area <= 0:
             continue
 
@@ -79,22 +75,38 @@ def calculate_vacuolization_per_object(rgb, labeled):
 
         patch_rgb = rgb[minr:maxr, minc:maxc]
         patch_hsv = hsv[minr:maxr, minc:maxc]
+        patch_gray = gray[minr:maxr, minc:maxc]
 
         pix_rgb = patch_rgb[obj_mask]
         pix_hsv = patch_hsv[obj_mask]
+        pix_gray = patch_gray[obj_mask]
 
         if len(pix_rgb) == 0:
             continue
 
-        # White / empty / vacuole-like area proxy:
-        # bright + low saturation
-        white_mask = (
-            (pix_hsv[:, 2] >= 180) &
-            (pix_hsv[:, 1] <= 70)
+        # Bright area: terang dan relatif kurang jenuh
+        bright_mask = (
+            (pix_hsv[:, 2] >= bright_v_thresh) &
+            (pix_hsv[:, 1] <= bright_s_thresh)
         )
 
-        white_pixels = int(np.sum(white_mask))
-        vac_pct = 100.0 * white_pixels / len(pix_rgb)
+        # Dense area: lebih gelap / lebih padat warnanya
+        dense_mask = (
+            (pix_hsv[:, 2] <= dense_v_thresh) |
+            (pix_hsv[:, 1] >= dense_s_thresh)
+        )
+
+        bright_pixels = int(np.sum(bright_mask))
+        dense_pixels = int(np.sum(dense_mask))
+
+        informative_pixels = bright_pixels + dense_pixels
+        if informative_pixels == 0:
+            vac_index = 0.0
+        else:
+            vac_index = 100.0 * bright_pixels / informative_pixels
+
+        bright_fraction_percent = 100.0 * bright_pixels / len(pix_rgb)
+        dense_fraction_percent = 100.0 * dense_pixels / len(pix_rgb)
 
         centroid_y, centroid_x = prop.centroid
 
@@ -103,22 +115,21 @@ def calculate_vacuolization_per_object(rgb, labeled):
             "area_px": area,
             "centroid_x": float(centroid_x),
             "centroid_y": float(centroid_y),
-            "white_pixels": white_pixels,
             "total_pixels": int(len(pix_rgb)),
-            "vacuolization_percent": float(vac_pct),
+            "bright_pixels": bright_pixels,
+            "dense_pixels": dense_pixels,
+            "bright_fraction_percent": float(bright_fraction_percent),
+            "dense_fraction_percent": float(dense_fraction_percent),
+            "vacuolization_index_percent": float(vac_index),
+            "mean_gray": float(np.mean(pix_gray)),
             "mean_r": float(np.mean(pix_rgb[:, 0])),
             "mean_g": float(np.mean(pix_rgb[:, 1])),
             "mean_b": float(np.mean(pix_rgb[:, 2]))
         })
 
     df = pd.DataFrame(records)
-
-    if df.empty:
-        mean_vacuolization = 0.0
-    else:
-        mean_vacuolization = float(df["vacuolization_percent"].mean())
-
-    return df, mean_vacuolization
+    mean_vac = 0.0 if df.empty else float(df["vacuolization_index_percent"].mean())
+    return df, mean_vac
 
 # =========================================================
 # SIDEBAR
@@ -130,9 +141,14 @@ with st.sidebar:
     blur_ksize = st.slider("Gaussian blur kernel", 3, 11, 5, 2)
 
     st.markdown("---")
-    st.header("White spot settings")
-    value_thresh = st.slider("Brightness threshold (V)", 100, 255, 180, 5)
-    sat_thresh = st.slider("Saturation threshold (S)", 0, 150, 70, 5)
+    st.header("Bright area settings")
+    bright_v_thresh = st.slider("Bright threshold V", 120, 255, 185, 5)
+    bright_s_thresh = st.slider("Bright threshold S", 0, 180, 95, 5)
+
+    st.markdown("---")
+    st.header("Dense area settings")
+    dense_v_thresh = st.slider("Dense threshold V", 0, 180, 145, 5)
+    dense_s_thresh = st.slider("Dense threshold S", 20, 255, 120, 5)
 
 # =========================================================
 # UPLOAD
@@ -155,62 +171,25 @@ if uploaded is not None:
     overlay = make_overlay(rgb, boundaries, boundary_color=(255, 255, 0))
     n_objects = int(labeled.max())
 
-    # hitung vacuolization dengan threshold sidebar
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    props = measure.regionprops(labeled)
-
-    records = []
-    for prop in props:
-        label_id = int(prop.label)
-        area = int(prop.area)
-        if area <= 0:
-            continue
-
-        minr, minc, maxr, maxc = prop.bbox
-        obj_mask = (labeled[minr:maxr, minc:maxc] == label_id)
-
-        patch_rgb = rgb[minr:maxr, minc:maxc]
-        patch_hsv = hsv[minr:maxr, minc:maxc]
-
-        pix_rgb = patch_rgb[obj_mask]
-        pix_hsv = patch_hsv[obj_mask]
-
-        if len(pix_rgb) == 0:
-            continue
-
-        white_mask = (
-            (pix_hsv[:, 2] >= value_thresh) &
-            (pix_hsv[:, 1] <= sat_thresh)
-        )
-
-        white_pixels = int(np.sum(white_mask))
-        vac_pct = 100.0 * white_pixels / len(pix_rgb)
-
-        centroid_y, centroid_x = prop.centroid
-
-        records.append({
-            "label_id": label_id,
-            "area_px": area,
-            "centroid_x": float(centroid_x),
-            "centroid_y": float(centroid_y),
-            "white_pixels": white_pixels,
-            "total_pixels": int(len(pix_rgb)),
-            "vacuolization_percent": float(vac_pct),
-            "mean_r": float(np.mean(pix_rgb[:, 0])),
-            "mean_g": float(np.mean(pix_rgb[:, 1])),
-            "mean_b": float(np.mean(pix_rgb[:, 2]))
-        })
-
-    vac_df = pd.DataFrame(records)
-    mean_vacuolization = 0.0 if vac_df.empty else float(vac_df["vacuolization_percent"].mean())
+    analysis_df, mean_vacuolization = compute_bright_dense_metrics(
+        rgb=rgb,
+        labeled=labeled,
+        bright_v_thresh=bright_v_thresh,
+        bright_s_thresh=bright_s_thresh,
+        dense_v_thresh=dense_v_thresh,
+        dense_s_thresh=dense_s_thresh
+    )
 
     st.success(f"Detected segmented objects: {n_objects}")
 
-    m1, m2 = st.columns(2)
+    m1, m2, m3 = st.columns(3)
     with m1:
         st.metric("Detected objects", f"{n_objects}")
     with m2:
         st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
+    with m3:
+        mean_dense = 0.0 if analysis_df.empty else float(analysis_df["dense_fraction_percent"].mean())
+        st.metric("Mean dense area", f"{mean_dense:.2f}%")
 
     st.image(
         overlay,
@@ -219,29 +198,31 @@ if uploaded is not None:
     )
 
     st.markdown("---")
-    st.subheader("Per-object vacuolization analysis")
+    st.subheader("Per-object bright and dense area analysis")
 
-    if vac_df.empty:
+    if analysis_df.empty:
         st.warning("No segmented objects detected.")
     else:
         st.dataframe(
-            vac_df[[
+            analysis_df[[
                 "label_id",
                 "area_px",
-                "white_pixels",
-                "total_pixels",
-                "vacuolization_percent",
+                "bright_pixels",
+                "dense_pixels",
+                "bright_fraction_percent",
+                "dense_fraction_percent",
+                "vacuolization_index_percent",
                 "centroid_x",
                 "centroid_y"
             ]],
             use_container_width=True
         )
 
-        csv = vac_df.to_csv(index=False).encode("utf-8")
+        csv = analysis_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download vacuolization CSV",
             data=csv,
-            file_name="liver_vacuolization_per_object.csv",
+            file_name="liver_bright_dense_vacuolization.csv",
             mime="text/csv"
         )
 
