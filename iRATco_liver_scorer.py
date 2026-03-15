@@ -1,6 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
+import pandas as pd
 from PIL import Image
 from skimage import morphology, segmentation, feature, measure
 
@@ -9,7 +10,7 @@ from skimage import morphology, segmentation, feature, measure
 # =========================================================
 st.set_page_config(page_title="iRATco Liver Cell Boundary", layout="wide")
 st.title("iRATco Liver Cell Boundary")
-st.caption("Upload histopathology liver image to generate hepatocyte boundaries with yellow overlay")
+st.caption("Upload histopathology liver image to generate hepatocyte boundaries and estimate vacuolization from white spots inside each segmented object")
 
 # =========================================================
 # HELPERS
@@ -56,6 +57,69 @@ def make_overlay(rgb, boundaries, boundary_color=(255, 255, 0)):
     overlay[boundaries] = boundary_color
     return overlay
 
+def calculate_vacuolization_per_object(rgb, labeled):
+    """
+    Menghitung white spot percentage per objek segmentasi.
+    White spot didefinisikan sebagai piksel terang dan saturasi rendah.
+    """
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    props = measure.regionprops(labeled)
+
+    records = []
+
+    for prop in props:
+        label_id = int(prop.label)
+        area = int(prop.area)
+
+        if area <= 0:
+            continue
+
+        minr, minc, maxr, maxc = prop.bbox
+        obj_mask = (labeled[minr:maxr, minc:maxc] == label_id)
+
+        patch_rgb = rgb[minr:maxr, minc:maxc]
+        patch_hsv = hsv[minr:maxr, minc:maxc]
+
+        pix_rgb = patch_rgb[obj_mask]
+        pix_hsv = patch_hsv[obj_mask]
+
+        if len(pix_rgb) == 0:
+            continue
+
+        # White / empty / vacuole-like area proxy:
+        # bright + low saturation
+        white_mask = (
+            (pix_hsv[:, 2] >= 180) &
+            (pix_hsv[:, 1] <= 70)
+        )
+
+        white_pixels = int(np.sum(white_mask))
+        vac_pct = 100.0 * white_pixels / len(pix_rgb)
+
+        centroid_y, centroid_x = prop.centroid
+
+        records.append({
+            "label_id": label_id,
+            "area_px": area,
+            "centroid_x": float(centroid_x),
+            "centroid_y": float(centroid_y),
+            "white_pixels": white_pixels,
+            "total_pixels": int(len(pix_rgb)),
+            "vacuolization_percent": float(vac_pct),
+            "mean_r": float(np.mean(pix_rgb[:, 0])),
+            "mean_g": float(np.mean(pix_rgb[:, 1])),
+            "mean_b": float(np.mean(pix_rgb[:, 2]))
+        })
+
+    df = pd.DataFrame(records)
+
+    if df.empty:
+        mean_vacuolization = 0.0
+    else:
+        mean_vacuolization = float(df["vacuolization_percent"].mean())
+
+    return df, mean_vacuolization
+
 # =========================================================
 # SIDEBAR
 # =========================================================
@@ -64,6 +128,11 @@ with st.sidebar:
     min_obj_size = st.slider("Minimum object size", 20, 500, 80, 5)
     peak_distance = st.slider("Peak min distance", 3, 40, 12, 1)
     blur_ksize = st.slider("Gaussian blur kernel", 3, 11, 5, 2)
+
+    st.markdown("---")
+    st.header("White spot settings")
+    value_thresh = st.slider("Brightness threshold (V)", 100, 255, 180, 5)
+    sat_thresh = st.slider("Saturation threshold (S)", 0, 150, 70, 5)
 
 # =========================================================
 # UPLOAD
@@ -86,8 +155,95 @@ if uploaded is not None:
     overlay = make_overlay(rgb, boundaries, boundary_color=(255, 255, 0))
     n_objects = int(labeled.max())
 
+    # hitung vacuolization dengan threshold sidebar
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    props = measure.regionprops(labeled)
+
+    records = []
+    for prop in props:
+        label_id = int(prop.label)
+        area = int(prop.area)
+        if area <= 0:
+            continue
+
+        minr, minc, maxr, maxc = prop.bbox
+        obj_mask = (labeled[minr:maxr, minc:maxc] == label_id)
+
+        patch_rgb = rgb[minr:maxr, minc:maxc]
+        patch_hsv = hsv[minr:maxr, minc:maxc]
+
+        pix_rgb = patch_rgb[obj_mask]
+        pix_hsv = patch_hsv[obj_mask]
+
+        if len(pix_rgb) == 0:
+            continue
+
+        white_mask = (
+            (pix_hsv[:, 2] >= value_thresh) &
+            (pix_hsv[:, 1] <= sat_thresh)
+        )
+
+        white_pixels = int(np.sum(white_mask))
+        vac_pct = 100.0 * white_pixels / len(pix_rgb)
+
+        centroid_y, centroid_x = prop.centroid
+
+        records.append({
+            "label_id": label_id,
+            "area_px": area,
+            "centroid_x": float(centroid_x),
+            "centroid_y": float(centroid_y),
+            "white_pixels": white_pixels,
+            "total_pixels": int(len(pix_rgb)),
+            "vacuolization_percent": float(vac_pct),
+            "mean_r": float(np.mean(pix_rgb[:, 0])),
+            "mean_g": float(np.mean(pix_rgb[:, 1])),
+            "mean_b": float(np.mean(pix_rgb[:, 2]))
+        })
+
+    vac_df = pd.DataFrame(records)
+    mean_vacuolization = 0.0 if vac_df.empty else float(vac_df["vacuolization_percent"].mean())
+
     st.success(f"Detected segmented objects: {n_objects}")
-    st.image(overlay, caption="Overlay on original (yellow boundaries)", use_container_width=True)
+
+    m1, m2 = st.columns(2)
+    with m1:
+        st.metric("Detected objects", f"{n_objects}")
+    with m2:
+        st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
+
+    st.image(
+        overlay,
+        caption="Overlay on original (yellow boundaries)",
+        use_container_width=True
+    )
+
+    st.markdown("---")
+    st.subheader("Per-object vacuolization analysis")
+
+    if vac_df.empty:
+        st.warning("No segmented objects detected.")
+    else:
+        st.dataframe(
+            vac_df[[
+                "label_id",
+                "area_px",
+                "white_pixels",
+                "total_pixels",
+                "vacuolization_percent",
+                "centroid_x",
+                "centroid_y"
+            ]],
+            use_container_width=True
+        )
+
+        csv = vac_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download vacuolization CSV",
+            data=csv,
+            file_name="liver_vacuolization_per_object.csv",
+            mime="text/csv"
+        )
 
 else:
     st.info("Please upload a liver histopathology image first.")
