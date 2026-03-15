@@ -176,7 +176,7 @@ def get_clicked_label(x, y, labeled, radius=20):
         return None
 
     best_label = None
-    best_dist = 1e9
+    best_dist = 1e18
     for rr, cc in coords:
         yy = y0 + rr
         xx = x0 + cc
@@ -240,12 +240,89 @@ def build_train_df(objects_df, samples):
         return pd.DataFrame()
     return pd.DataFrame(rows)
 
+
+def make_segmentation_overlay(rgb, labeled):
+    rng = np.random.default_rng(123)
+    out = np.zeros_like(rgb)
+
+    for lid in np.unique(labeled):
+        if lid == 0:
+            continue
+        color_val = rng.integers(50, 255, size=3, dtype=np.uint8)
+        out[labeled == lid] = color_val
+
+    boundaries = segmentation.find_boundaries(labeled, mode="outer")
+    out[boundaries] = [255, 255, 255]
+    return out
+
+
+def crop_single_cell(rgb, labeled, row, pad=8, target_size=96):
+    lid = int(row["label_id"])
+
+    minr = max(int(row["bbox_minr"]) - pad, 0)
+    minc = max(int(row["bbox_minc"]) - pad, 0)
+    maxr = min(int(row["bbox_maxr"]) + pad, rgb.shape[0])
+    maxc = min(int(row["bbox_maxc"]) + pad, rgb.shape[1])
+
+    crop_rgb = rgb[minr:maxr, minc:maxc].copy()
+    crop_mask = labeled[minr:maxr, minc:maxc] == lid
+
+    if crop_rgb.size == 0:
+        return None
+
+    canvas = np.ones_like(crop_rgb, dtype=np.uint8) * 255
+    canvas[crop_mask] = crop_rgb[crop_mask]
+
+    boundary = segmentation.find_boundaries(crop_mask, mode="outer")
+    canvas[boundary] = [255, 0, 0]
+
+    h, w = canvas.shape[:2]
+    if h == 0 or w == 0:
+        return None
+
+    scale = min(target_size / max(h, 1), target_size / max(w, 1))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+
+    resized = cv2.resize(canvas, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    final_canvas = np.ones((target_size, target_size, 3), dtype=np.uint8) * 255
+    y0 = (target_size - new_h) // 2
+    x0 = (target_size - new_w) // 2
+    final_canvas[y0:y0+new_h, x0:x0+new_w] = resized
+
+    return final_canvas
+
+
+def show_cell_gallery(objects_df, rgb, labeled, n_cols=6, max_cells=60):
+    st.subheader("Segmented cells gallery")
+
+    if objects_df is None or objects_df.empty:
+        st.info("No segmented objects.")
+        return
+
+    show_df = objects_df.head(max_cells).copy()
+    chunks = [show_df.iloc[i:i+n_cols] for i in range(0, len(show_df), n_cols)]
+
+    for chunk in chunks:
+        cols = st.columns(n_cols)
+        for i in range(n_cols):
+            with cols[i]:
+                if i < len(chunk):
+                    row = chunk.iloc[i]
+                    thumb = crop_single_cell(rgb, labeled, row, pad=8, target_size=96)
+                    if thumb is not None:
+                        st.image(thumb, use_container_width=True)
+                        st.caption(f"ID {int(row['label_id'])}")
+
 # =========================================================
 # SIDEBAR
 # =========================================================
 with st.sidebar:
     st.header("Controls")
     active_class = st.selectbox("Annotation class", CLASSES)
+    show_gallery = st.checkbox("Show segmented cell gallery", value=True)
+    show_seg_overlay = st.checkbox("Show segmentation overlay", value=True)
 
     if st.button("Reset all"):
         reset_all()
@@ -258,7 +335,10 @@ with st.sidebar:
 # =========================================================
 # UPLOAD
 # =========================================================
-uploaded = st.file_uploader("Upload liver histopathology image", type=["png", "jpg", "jpeg", "tif", "tiff"])
+uploaded = st.file_uploader(
+    "Upload liver histopathology image",
+    type=["png", "jpg", "jpeg", "tif", "tiff"]
+)
 
 if uploaded is not None:
     if st.session_state.last_file != uploaded.name:
@@ -277,9 +357,9 @@ if uploaded is not None:
     labeled = st.session_state.labeled
     objects_df = st.session_state.objects_df
 
-    col1, col2 = st.columns([1.4, 1])
+    top_left, top_right = st.columns([1.4, 1])
 
-    with col1:
+    with top_left:
         st.subheader("Image annotation")
 
         preview = draw_preview(
@@ -335,7 +415,7 @@ if uploaded is not None:
                 ]
                 st.rerun()
 
-    with col2:
+    with top_right:
         st.subheader("Training and classification")
 
         st.write("Detected objects:", len(objects_df))
@@ -412,5 +492,15 @@ if uploaded is not None:
                     mime="text/csv"
                 )
 
+    st.markdown("---")
+    st.subheader("Segmentation result")
+
+    if show_seg_overlay:
+        seg_overlay = make_segmentation_overlay(rgb, labeled)
+        st.image(seg_overlay, caption="Segmentation overlay per object", use_container_width=True)
+
+    if show_gallery:
+        show_cell_gallery(objects_df, rgb, labeled, n_cols=6, max_cells=60)
+
 st.markdown("---")
-st.caption("Versi dasar dulu: fokus supaya upload, klik anotasi, training, dan classify berjalan stabil.")
+st.caption("Versi dasar dengan tampilan segmentasi per sel.")
