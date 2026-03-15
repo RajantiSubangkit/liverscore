@@ -20,15 +20,18 @@ st.set_page_config(
 
 st.title("iRATco-Liver Histo Scorer")
 st.caption(
-    "Semi-automatic analysis of nuclei, cytoplasm, and inflammatory cells "
-    "from liver histopathology images"
+    "Semi-automatic analysis of inflammatory cells, pyknotic nuclei, "
+    "and cytoplasmic vacuolization from liver histopathology images"
 )
 
 # =========================================================
 # SESSION STATE
 # =========================================================
-if "nucleus_samples" not in st.session_state:
-    st.session_state.nucleus_samples = []
+if "nucleus_normal_samples" not in st.session_state:
+    st.session_state.nucleus_normal_samples = []
+
+if "nucleus_pyknotic_samples" not in st.session_state:
+    st.session_state.nucleus_pyknotic_samples = []
 
 if "cytoplasm_samples" not in st.session_state:
     st.session_state.cytoplasm_samples = []
@@ -56,7 +59,8 @@ if "last_uploaded_name" not in st.session_state:
 # HELPERS
 # =========================================================
 def reset_all():
-    st.session_state.nucleus_samples = []
+    st.session_state.nucleus_normal_samples = []
+    st.session_state.nucleus_pyknotic_samples = []
     st.session_state.cytoplasm_samples = []
     st.session_state.inflam_samples = []
     st.session_state.objects_df = None
@@ -75,7 +79,7 @@ def make_display_image(rgb, max_width=900):
         return rgb.copy(), 1.0
     scale = max_width / w
     new_h = int(h * scale)
-    resized = cv2.resize(rgb, (max_width, new_h))
+    resized = cv2.resize(rgb, (max_width, new_h), interpolation=cv2.INTER_NEAREST)
     return resized, scale
 
 
@@ -88,14 +92,14 @@ def preprocess_and_segment(rgb):
     )
 
     binary_bool = binary > 0
-    binary_bool = morphology.remove_small_objects(binary_bool, min_size=50)
-    binary_bool = morphology.remove_small_holes(binary_bool, area_threshold=50)
+    binary_bool = morphology.remove_small_objects(binary_bool, min_size=40)
+    binary_bool = morphology.remove_small_holes(binary_bool, area_threshold=40)
 
     dist = cv2.distanceTransform((binary_bool.astype(np.uint8) * 255), cv2.DIST_L2, 5)
 
     local_max = feature.peak_local_max(
         dist,
-        min_distance=8,
+        min_distance=6,
         labels=binary_bool
     )
 
@@ -121,7 +125,7 @@ def extract_object_features(rgb, gray, labeled):
 
     for prop in props:
         area = prop.area
-        if area < 50:
+        if area < 40:
             continue
 
         minr, minc, maxr, maxc = prop.bbox
@@ -173,23 +177,33 @@ def extract_object_features(rgb, gray, labeled):
         extent = float(prop.extent) if prop.extent is not None else np.nan
         aspect_ratio = float(major_axis / minor_axis) if minor_axis and minor_axis > 0 else np.nan
 
-        # vacuolization proxy
-        bright_low_sat = (pix_hsv[:, 2] > 170) & (pix_hsv[:, 1] < 80)
-        pale_lab = pix_lab[:, 0] > 70
-        vac_mask = bright_low_sat & pale_lab
-        vacuole_fraction = float(np.mean(vac_mask)) if len(vac_mask) > 0 else 0.0
+        # -------------------------------------------------
+        # pink density and white empty fraction
+        # -------------------------------------------------
+        # pink-ish eosin cytoplasm
+        pink_mask = (
+            (pix_lab[:, 1] > 8) &          # a* positive -> red/pink
+            (pix_lab[:, 2] > 0) &          # b* slightly yellow
+            (pix_lab[:, 0] > 45) &         # not too dark
+            (pix_lab[:, 0] < 85)
+        )
 
-        # color density proxy
-        color_density = float(
-            np.mean(
-                np.sqrt(
-                    (pix_rgb[:, 0] / 255.0) ** 2 +
-                    (pix_rgb[:, 1] / 255.0) ** 2 +
-                    (pix_rgb[:, 2] / 255.0) ** 2
-                )
-            )
-        ) if len(pix_rgb) > 0 else 0.0
+        # white / empty vacuole-like area
+        white_mask = (
+            (pix_hsv[:, 1] < 35) &         # low saturation
+            (pix_hsv[:, 2] > 180) &        # bright
+            (pix_lab[:, 0] > 75)
+        )
 
+        pink_fraction = float(np.mean(pink_mask)) if len(pink_mask) > 0 else 0.0
+        white_fraction = float(np.mean(white_mask)) if len(white_mask) > 0 else 0.0
+
+        denom = pink_fraction + white_fraction
+        vacuolization_percent = float((white_fraction / denom) * 100.0) if denom > 0 else 0.0
+        pink_density_percent = float((pink_fraction / denom) * 100.0) if denom > 0 else 0.0
+
+        # pyknosis-oriented proxy
+        # pyknotic nucleus tends to be smaller and darker
         cy, cx = prop.centroid
 
         records.append({
@@ -222,47 +236,31 @@ def extract_object_features(rgb, gray, labeled):
             "mean_a": mean_a,
             "mean_b_lab": mean_b_lab,
             "granularity": lap_var,
-            "vacuole_fraction": vacuole_fraction,
-            "color_density": color_density
+            "pink_fraction": pink_fraction,
+            "white_fraction": white_fraction,
+            "pink_density_percent": pink_density_percent,
+            "cytoplasm_vacuolization_percent": vacuolization_percent
         })
 
     df = pd.DataFrame(records)
 
     if not df.empty:
-        median_area = df["area"].median()
-        if median_area > 0:
-            df["variety_index"] = (df["area"] - median_area).abs() / median_area
-        else:
-            df["variety_index"] = 0.0
+        area_med = df["area"].median()
+        if area_med <= 0:
+            area_med = 1.0
 
-        median_intensity = df["mean_intensity"].median()
-        std_intensity_global = df["mean_intensity"].std() if len(df) > 1 else 1.0
-        if std_intensity_global == 0 or np.isnan(std_intensity_global):
-            std_intensity_global = 1.0
+        intensity_med = df["mean_intensity"].median()
+        intensity_std = df["mean_intensity"].std()
+        if pd.isna(intensity_std) or intensity_std == 0:
+            intensity_std = 1.0
 
-        df["intensity_variety_index"] = (
-            np.abs(df["mean_intensity"] - median_intensity) / std_intensity_global
-        )
-
-        df["combined_nucleus_variety"] = (
-            0.6 * df["variety_index"] + 0.4 * (df["intensity_variety_index"] / 3.0)
-        )
-
-        df["anisocytosis_flag"] = np.where(
-            df["combined_nucleus_variety"] > 0.5,
-            "Anisocytosis",
-            "Non-anisocytosis"
-        )
-
-        df["cytoplasm_vacuolization_percent"] = df["vacuole_fraction"] * 100.0
-        df["cytoplasm_color_density_percent"] = df["color_density"] * 100.0
+        df["smallness_index"] = area_med / df["area"]
+        df["darkness_index"] = np.abs(intensity_med - df["mean_intensity"]) / intensity_std
+        df["pyknosis_score"] = 0.6 * df["smallness_index"] + 0.4 * df["darkness_index"]
     else:
-        df["variety_index"] = []
-        df["intensity_variety_index"] = []
-        df["combined_nucleus_variety"] = []
-        df["anisocytosis_flag"] = []
-        df["cytoplasm_vacuolization_percent"] = []
-        df["cytoplasm_color_density_percent"] = []
+        df["smallness_index"] = []
+        df["darkness_index"] = []
+        df["pyknosis_score"] = []
 
     return df
 
@@ -273,27 +271,53 @@ def feature_columns():
         "circularity", "roundness", "eccentricity", "solidity",
         "extent", "aspect_ratio", "mean_intensity", "std_intensity",
         "mean_r", "mean_g", "mean_b", "mean_h", "mean_s", "mean_v",
-        "mean_l", "mean_a", "mean_b_lab",
-        "granularity", "vacuole_fraction", "color_density",
-        "variety_index", "intensity_variety_index", "combined_nucleus_variety"
+        "mean_l", "mean_a", "mean_b_lab", "granularity",
+        "pink_fraction", "white_fraction",
+        "pink_density_percent", "cytoplasm_vacuolization_percent",
+        "smallness_index", "darkness_index", "pyknosis_score"
     ]
 
 
-def find_nearest_object(x, y, objects_df, max_dist=35):
-    if objects_df is None or objects_df.empty:
+def get_clicked_label(x, y, labeled, max_radius=20):
+    h, w = labeled.shape
+
+    if x < 0 or y < 0 or x >= w or y >= h:
         return None
 
-    dx = objects_df["centroid_x"] - x
-    dy = objects_df["centroid_y"] - y
-    dist = np.sqrt(dx ** 2 + dy ** 2)
-    idx = dist.idxmin()
+    direct_label = int(labeled[y, x])
+    if direct_label > 0:
+        return direct_label
 
-    if dist.loc[idx] <= max_dist:
-        return int(objects_df.loc[idx, "label_id"])
-    return None
+    # fallback: cari label nonzero terdekat di sekitar titik klik
+    r0 = max(0, y - max_radius)
+    r1 = min(h, y + max_radius + 1)
+    c0 = max(0, x - max_radius)
+    c1 = min(w, x + max_radius + 1)
+
+    patch = labeled[r0:r1, c0:c1]
+    ys, xs = np.where(patch > 0)
+
+    if len(xs) == 0:
+        return None
+
+    abs_xs = xs + c0
+    abs_ys = ys + r0
+    d2 = (abs_xs - x) ** 2 + (abs_ys - y) ** 2
+    idx = np.argmin(d2)
+
+    return int(labeled[abs_ys[idx], abs_xs[idx]])
 
 
-def annotate_image(rgb, objects_df, labeled, nucleus_ids=None, cytoplasm_ids=None, inflam_ids=None, result_df=None, mode="Nucleus"):
+def annotate_image(
+    rgb,
+    objects_df,
+    nucleus_normal_ids=None,
+    nucleus_pyknotic_ids=None,
+    cytoplasm_ids=None,
+    inflam_ids=None,
+    result_df=None,
+    mode="Nucleus"
+):
     out = rgb.copy()
 
     if result_df is not None and not result_df.empty:
@@ -303,28 +327,42 @@ def annotate_image(rgb, objects_df, labeled, nucleus_ids=None, cytoplasm_ids=Non
             maxr = int(row["bbox_maxr"])
             maxc = int(row["bbox_maxc"])
 
-            if mode == "Nucleus":
-                color_val = (255, 0, 0) if row.get("anisocytosis_flag", "Non-anisocytosis") == "Anisocytosis" else (180, 180, 180)
-            elif mode == "Cytoplasm":
+            color_val = (180, 180, 180)
+
+            if mode == "Nucleus" and row.get("is_nucleus", 0) == 1:
+                if row.get("nucleus_class", "Normal nucleus") == "Pyknotic nucleus":
+                    color_val = (255, 0, 0)
+                else:
+                    color_val = (0, 255, 0)
+
+            elif mode == "Cytoplasm" and row.get("is_cytoplasm", 0) == 1:
                 vac_pct = row.get("cytoplasm_vacuolization_percent", 0)
-                if vac_pct > 35:
+                if vac_pct >= 60:
                     color_val = (0, 0, 255)
-                elif vac_pct >= 15:
+                elif vac_pct >= 30:
                     color_val = (0, 200, 255)
                 else:
-                    color_val = (180, 180, 180)
-            else:
-                infl = row.get("is_inflammation", 0)
-                color_val = (255, 0, 0) if infl == 1 else (180, 180, 180)
+                    color_val = (0, 255, 0)
+
+            elif mode == "Inflammation":
+                if row.get("is_inflammation", 0) == 1:
+                    color_val = (255, 0, 255)
 
             cv2.rectangle(out, (minc, minr), (maxc, maxr), color_val, 1)
 
-    for lid in nucleus_ids or []:
+    for lid in nucleus_normal_ids or []:
         row = objects_df[objects_df["label_id"] == lid]
         if len(row) == 1:
             cx = int(row.iloc[0]["centroid_x"])
             cy = int(row.iloc[0]["centroid_y"])
-            cv2.circle(out, (cx, cy), 7, (255, 255, 0), 2)
+            cv2.circle(out, (cx, cy), 7, (0, 255, 0), 2)
+
+    for lid in nucleus_pyknotic_ids or []:
+        row = objects_df[objects_df["label_id"] == lid]
+        if len(row) == 1:
+            cx = int(row.iloc[0]["centroid_x"])
+            cy = int(row.iloc[0]["centroid_y"])
+            cv2.circle(out, (cx, cy), 7, (255, 0, 0), 2)
 
     for lid in cytoplasm_ids or []:
         row = objects_df[objects_df["label_id"] == lid]
@@ -354,12 +392,20 @@ with st.sidebar:
         ["Inflammation", "Nucleus", "Cytoplasm"]
     )
 
+    nucleus_label = None
+    if mode == "Nucleus":
+        nucleus_label = st.radio(
+            "Nucleus label",
+            ["Normal nucleus", "Pyknotic nucleus"]
+        )
+
     if st.button("Reset all"):
         reset_all()
         st.rerun()
 
     st.markdown("---")
-    st.write(f"Nucleus samples: {len(st.session_state.nucleus_samples)}")
+    st.write(f"Normal nucleus samples: {len(st.session_state.nucleus_normal_samples)}")
+    st.write(f"Pyknotic nucleus samples: {len(st.session_state.nucleus_pyknotic_samples)}")
     st.write(f"Cytoplasm samples: {len(st.session_state.cytoplasm_samples)}")
     st.write(f"Inflammation samples: {len(st.session_state.inflam_samples)}")
 
@@ -390,15 +436,16 @@ if uploaded is not None:
     st.session_state.labeled_mask = labeled
     st.session_state.preview_rgb = rgb
 
-    colL, colR = st.columns([1.4, 1])
+    colL, colR = st.columns([1.45, 1])
 
     with colL:
         st.subheader("Annotation")
+
         preview = annotate_image(
             rgb,
             objects_df=st.session_state.objects_df,
-            labeled=st.session_state.labeled_mask,
-            nucleus_ids=st.session_state.nucleus_samples,
+            nucleus_normal_ids=st.session_state.nucleus_normal_samples,
+            nucleus_pyknotic_ids=st.session_state.nucleus_pyknotic_samples,
             cytoplasm_ids=st.session_state.cytoplasm_samples,
             inflam_ids=st.session_state.inflam_samples,
             result_df=st.session_state.result_df,
@@ -406,34 +453,57 @@ if uploaded is not None:
         )
 
         display_img, scale = make_display_image(preview, max_width=850)
-        click = streamlit_image_coordinates(display_img)
+        click = streamlit_image_coordinates(display_img, key="main_image_click")
 
         if click is not None:
-            real_x = int(click["x"] / scale)
-            real_y = int(click["y"] / scale)
-            nearest_id = find_nearest_object(real_x, real_y, st.session_state.objects_df)
+            real_x = int(round(click["x"] / scale))
+            real_y = int(round(click["y"] / scale))
 
-            if nearest_id is not None:
+            clicked_label = get_clicked_label(
+                real_x,
+                real_y,
+                st.session_state.labeled_mask,
+                max_radius=20
+            )
+
+            if clicked_label is not None:
                 if mode == "Nucleus":
-                    target_list = st.session_state.nucleus_samples
+                    if nucleus_label == "Normal nucleus":
+                        target_list = st.session_state.nucleus_normal_samples
+                        other_list = st.session_state.nucleus_pyknotic_samples
+                    else:
+                        target_list = st.session_state.nucleus_pyknotic_samples
+                        other_list = st.session_state.nucleus_normal_samples
+
+                    if clicked_label not in target_list:
+                        if clicked_label in other_list:
+                            other_list.remove(clicked_label)
+                        target_list.append(clicked_label)
+                        st.rerun()
+
                 elif mode == "Cytoplasm":
-                    target_list = st.session_state.cytoplasm_samples
+                    if clicked_label not in st.session_state.cytoplasm_samples:
+                        st.session_state.cytoplasm_samples.append(clicked_label)
+                        st.rerun()
+
                 else:
-                    target_list = st.session_state.inflam_samples
+                    if clicked_label not in st.session_state.inflam_samples:
+                        st.session_state.inflam_samples.append(clicked_label)
+                        st.rerun()
 
-                if nearest_id not in target_list:
-                    target_list.append(nearest_id)
-                    st.rerun()
-
-        st.caption("Click object examples according to the selected mode.")
+        st.caption("Klik langsung pada objek. Sistem akan mengambil label piksel yang diklik, bukan centroid terdekat.")
 
         c1, c2, c3 = st.columns(3)
 
         with c1:
             if st.button("Undo last"):
-                if mode == "Nucleus" and len(st.session_state.nucleus_samples) > 0:
-                    st.session_state.nucleus_samples.pop()
-                    st.rerun()
+                if mode == "Nucleus":
+                    if nucleus_label == "Normal nucleus" and len(st.session_state.nucleus_normal_samples) > 0:
+                        st.session_state.nucleus_normal_samples.pop()
+                        st.rerun()
+                    elif nucleus_label == "Pyknotic nucleus" and len(st.session_state.nucleus_pyknotic_samples) > 0:
+                        st.session_state.nucleus_pyknotic_samples.pop()
+                        st.rerun()
                 elif mode == "Cytoplasm" and len(st.session_state.cytoplasm_samples) > 0:
                     st.session_state.cytoplasm_samples.pop()
                     st.rerun()
@@ -444,7 +514,10 @@ if uploaded is not None:
         with c2:
             if st.button("Clear current mode"):
                 if mode == "Nucleus":
-                    st.session_state.nucleus_samples = []
+                    if nucleus_label == "Normal nucleus":
+                        st.session_state.nucleus_normal_samples = []
+                    else:
+                        st.session_state.nucleus_pyknotic_samples = []
                 elif mode == "Cytoplasm":
                     st.session_state.cytoplasm_samples = []
                 else:
@@ -459,21 +532,26 @@ if uploaded is not None:
     with colR:
         st.subheader("Analysis")
 
-        st.write(f"Nucleus annotated objects: {len(st.session_state.nucleus_samples)}")
-        st.write(f"Cytoplasm annotated objects: {len(st.session_state.cytoplasm_samples)}")
-        st.write(f"Inflammation annotated objects: {len(st.session_state.inflam_samples)}")
+        st.write(f"Normal nucleus annotated: {len(st.session_state.nucleus_normal_samples)}")
+        st.write(f"Pyknotic nucleus annotated: {len(st.session_state.nucleus_pyknotic_samples)}")
+        st.write(f"Cytoplasm annotated: {len(st.session_state.cytoplasm_samples)}")
+        st.write(f"Inflammation annotated: {len(st.session_state.inflam_samples)}")
 
         if st.button("Run analysis"):
             result_df = st.session_state.objects_df.copy()
             X_all = result_df[feature_columns()].copy()
 
-            # =========================================
-            # NUCLEUS MODEL / SELECTION
-            # =========================================
+            # =====================================================
+            # NUCLEUS DETECTION
+            # =====================================================
             result_df["is_nucleus"] = 0
-            if len(st.session_state.nucleus_samples) >= 2:
+            normal_ids = st.session_state.nucleus_normal_samples
+            pyk_ids = st.session_state.nucleus_pyknotic_samples
+            all_nucleus_ids = list(set(normal_ids + pyk_ids))
+
+            if len(all_nucleus_ids) >= 2:
                 nucleus_train = result_df.copy()
-                nucleus_train["target"] = nucleus_train["label_id"].isin(st.session_state.nucleus_samples).astype(int)
+                nucleus_train["target"] = nucleus_train["label_id"].isin(all_nucleus_ids).astype(int)
 
                 y_train = nucleus_train["target"]
                 X_train = nucleus_train[feature_columns()].copy()
@@ -487,23 +565,58 @@ if uploaded is not None:
                     class_weight="balanced"
                 )
                 clf_nucleus.fit(X_train, y_train)
-                pred_nucleus = clf_nucleus.predict(X_all_filled)
-                result_df["is_nucleus"] = pred_nucleus
+                result_df["is_nucleus"] = clf_nucleus.predict(X_all_filled)
             else:
                 result_df["is_nucleus"] = (
-                    (result_df["area"] <= result_df["area"].quantile(0.6)) &
-                    (result_df["mean_intensity"] <= result_df["mean_intensity"].quantile(0.6))
+                    (result_df["area"] <= result_df["area"].quantile(0.55)) &
+                    (result_df["mean_intensity"] <= result_df["mean_intensity"].quantile(0.65))
                 ).astype(int)
 
-            result_df["anisocytosis_flag"] = np.where(
-                result_df["combined_nucleus_variety"] > 0.5,
-                "Anisocytosis",
-                "Non-anisocytosis"
-            )
+            # classify normal vs pyknotic among nuclei
+            result_df["nucleus_class"] = "Normal nucleus"
 
-            # =========================================
-            # CYTOPLASM MODEL / SELECTION
-            # =========================================
+            nucleus_subset = result_df[result_df["is_nucleus"] == 1].copy()
+
+            class_train_ids = normal_ids + pyk_ids
+            if len(normal_ids) >= 1 and len(pyk_ids) >= 1:
+                class_train = result_df[result_df["label_id"].isin(class_train_ids)].copy()
+
+                if len(class_train) >= 2 and class_train["label_id"].nunique() >= 2:
+                    class_train["target"] = np.where(
+                        class_train["label_id"].isin(pyk_ids),
+                        "Pyknotic nucleus",
+                        "Normal nucleus"
+                    )
+
+                    X_train = class_train[feature_columns()].copy()
+                    y_train = class_train["target"].copy()
+
+                    X_train = X_train.fillna(X_train.median(numeric_only=True))
+                    X_pred = nucleus_subset[feature_columns()].copy().fillna(X_train.median(numeric_only=True))
+
+                    clf_nucleus_class = RandomForestClassifier(
+                        n_estimators=200,
+                        random_state=42,
+                        class_weight="balanced"
+                    )
+                    clf_nucleus_class.fit(X_train, y_train)
+
+                    pred_class = clf_nucleus_class.predict(X_pred)
+                    result_df.loc[result_df["is_nucleus"] == 1, "nucleus_class"] = pred_class
+            else:
+                # fallback by pyknosis score
+                nuc_idx = result_df["is_nucleus"] == 1
+                if nuc_idx.sum() > 0:
+                    threshold = result_df.loc[nuc_idx, "pyknosis_score"].median()
+                    result_df.loc[nuc_idx, "nucleus_class"] = np.where(
+                        result_df.loc[nuc_idx, "pyknosis_score"] >= threshold,
+                        "Pyknotic nucleus",
+                        "Normal nucleus"
+                    )
+
+            # =====================================================
+            # CYTOPLASM DETECTION
+            # =====================================================
             result_df["is_cytoplasm"] = 0
             if len(st.session_state.cytoplasm_samples) >= 2:
                 cyt_train = result_df.copy()
@@ -521,16 +634,15 @@ if uploaded is not None:
                     class_weight="balanced"
                 )
                 clf_cyt.fit(X_train, y_train)
-                pred_cyt = clf_cyt.predict(X_all_filled)
-                result_df["is_cytoplasm"] = pred_cyt
+                result_df["is_cytoplasm"] = clf_cyt.predict(X_all_filled)
             else:
                 result_df["is_cytoplasm"] = (
-                    result_df["area"] >= result_df["area"].quantile(0.4)
+                    result_df["area"] >= result_df["area"].quantile(0.45)
                 ).astype(int)
 
-            # =========================================
-            # INFLAMMATION MODEL / SELECTION
-            # =========================================
+            # =====================================================
+            # INFLAMMATION DETECTION
+            # =====================================================
             result_df["is_inflammation"] = 0
             if len(st.session_state.inflam_samples) >= 2:
                 infl_train = result_df.copy()
@@ -548,8 +660,7 @@ if uploaded is not None:
                     class_weight="balanced"
                 )
                 clf_infl.fit(X_train, y_train)
-                pred_infl = clf_infl.predict(X_all_filled)
-                result_df["is_inflammation"] = pred_infl
+                result_df["is_inflammation"] = clf_infl.predict(X_all_filled)
             else:
                 result_df["is_inflammation"] = (
                     (result_df["area"] < result_df["area"].median()) &
@@ -567,52 +678,47 @@ if uploaded is not None:
             cytoplasm_df = result_df[result_df["is_cytoplasm"] == 1].copy()
             inflam_df = result_df[result_df["is_inflammation"] == 1].copy()
 
-            # =========================================
+            # =====================================================
             # METRICS
-            # =========================================
-            total_area = result_df["area"].sum() if len(result_df) > 0 else 1.0
-            inflam_area = inflam_df["area"].sum() if len(inflam_df) > 0 else 0.0
-            inflammation_area_percent = 100 * inflam_area / total_area if total_area > 0 else 0.0
-
+            # =====================================================
             total_fov_area = rgb.shape[0] * rgb.shape[1]
+            inflam_area = inflam_df["area"].sum() if len(inflam_df) > 0 else 0.0
             inflammation_fov_percent = 100 * inflam_area / total_fov_area if total_fov_area > 0 else 0.0
 
-            anisocytosis_percent = (
-                100 * (nucleus_df["anisocytosis_flag"] == "Anisocytosis").mean()
-                if len(nucleus_df) > 0 else 0.0
-            )
+            total_nuclei = len(nucleus_df)
+            total_pyknotic = int((nucleus_df["nucleus_class"] == "Pyknotic nucleus").sum()) if total_nuclei > 0 else 0
+            pyknotic_percent = 100 * total_pyknotic / total_nuclei if total_nuclei > 0 else 0.0
 
-            mean_nucleus_variety = nucleus_df["combined_nucleus_variety"].mean() if len(nucleus_df) > 0 else 0.0
             mean_vacuolization = cytoplasm_df["cytoplasm_vacuolization_percent"].mean() if len(cytoplasm_df) > 0 else 0.0
-            mean_color_density = cytoplasm_df["cytoplasm_color_density_percent"].mean() if len(cytoplasm_df) > 0 else 0.0
+            mean_pink_density = cytoplasm_df["pink_density_percent"].mean() if len(cytoplasm_df) > 0 else 0.0
 
             m1, m2 = st.columns(2)
             with m1:
                 st.metric("Total inflammatory cells", f"{len(inflam_df)}")
                 st.metric("Inflammation area / field", f"{inflammation_fov_percent:.2f}%")
             with m2:
-                st.metric("Anisocytosis in nuclei", f"{anisocytosis_percent:.1f}%")
-                st.metric("Mean nucleus variety", f"{mean_nucleus_variety:.3f}")
+                st.metric("Total nuclei", f"{total_nuclei}")
+                st.metric("Pyknotic nuclei", f"{total_pyknotic} ({pyknotic_percent:.1f}%)")
 
             m3, m4 = st.columns(2)
             with m3:
-                st.metric("Mean cytoplasm vacuolization", f"{mean_vacuolization:.1f}%")
+                st.metric("Mean vacuolization", f"{mean_vacuolization:.1f}%")
             with m4:
-                st.metric("Mean cytoplasm color density", f"{mean_color_density:.1f}%")
+                st.metric("Mean pink density", f"{mean_pink_density:.1f}%")
 
-            # =========================================
+            # =====================================================
             # TABLES
-            # =========================================
+            # =====================================================
             st.write("### Nucleus analysis")
             if len(nucleus_df) > 0:
                 nucleus_table = nucleus_df[[
                     "label_id",
                     "area",
                     "mean_intensity",
-                    "variety_index",
-                    "intensity_variety_index",
-                    "combined_nucleus_variety",
-                    "anisocytosis_flag"
+                    "smallness_index",
+                    "darkness_index",
+                    "pyknosis_score",
+                    "nucleus_class"
                 ]].copy()
                 st.dataframe(nucleus_table, use_container_width=True)
             else:
@@ -623,7 +729,7 @@ if uploaded is not None:
                 cytoplasm_table = cytoplasm_df[[
                     "label_id",
                     "area",
-                    "cytoplasm_color_density_percent",
+                    "pink_density_percent",
                     "cytoplasm_vacuolization_percent"
                 ]].copy()
                 st.dataframe(cytoplasm_table, use_container_width=True)
@@ -642,14 +748,14 @@ if uploaded is not None:
             else:
                 st.info("No inflammatory objects detected.")
 
-            # =========================================
+            # =====================================================
             # PLOTS
-            # =========================================
+            # =====================================================
             if len(nucleus_df) > 0:
                 fig1, ax1 = plt.subplots(figsize=(5, 3.5))
-                vals = nucleus_df["anisocytosis_flag"].value_counts()
+                vals = nucleus_df["nucleus_class"].value_counts()
                 ax1.bar(vals.index, vals.values)
-                ax1.set_title("Nuclear anisocytosis")
+                ax1.set_title("Normal vs pyknotic nuclei")
                 ax1.set_ylabel("Count")
                 st.pyplot(fig1)
                 plt.close(fig1)
@@ -672,15 +778,15 @@ if uploaded is not None:
                 st.pyplot(fig3)
                 plt.close(fig3)
 
-            # =========================================
+            # =====================================================
             # IMAGE OUTPUT
-            # =========================================
+            # =====================================================
             st.image(
                 annotate_image(
                     st.session_state.preview_rgb,
                     objects_df=st.session_state.objects_df,
-                    labeled=st.session_state.labeled_mask,
-                    nucleus_ids=st.session_state.nucleus_samples,
+                    nucleus_normal_ids=st.session_state.nucleus_normal_samples,
+                    nucleus_pyknotic_ids=st.session_state.nucleus_pyknotic_samples,
                     cytoplasm_ids=st.session_state.cytoplasm_samples,
                     inflam_ids=st.session_state.inflam_samples,
                     result_df=result_df,
@@ -701,6 +807,6 @@ if uploaded is not None:
 st.markdown("---")
 st.caption(
     "Prototype only. This tool uses object-level proxy segmentation. "
-    "For research-grade results, nucleus, cytoplasm, and inflammatory cells "
-    "should ideally be segmented with dedicated models or stain-specific rules."
+    "For research-grade analysis, nucleus, cytoplasm, and inflammatory cell "
+    "segmentation should be refined for stain, magnification, species, and tissue quality."
 )
