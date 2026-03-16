@@ -349,12 +349,8 @@ else:
     st.info("Please upload a liver histopathology image first.")
 
 st.markdown("---")
-st.caption("Prototype version. Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold.
-
-    © 2026 Mawar Subangkit
-
-    Semi-automatic Inflammatory Cell Counting from Histopathology Images
-
+st.caption("Prototype version. Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold. 
+    © 2026 Mawar Subangkit  
     If you use this software, please cite:
 
     Subangkit, MAWAR (2026):**iRATco Liver Vacuolization Measure** Images Available at: https://https://liverscore.streamlit.app/")
