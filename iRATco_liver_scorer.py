@@ -229,35 +229,44 @@ if uploaded is not None:
 
     st.success(f"Detected segmented objects: {n_objects}")
 
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("Detected objects", f"{n_objects}")
-    with m2:
-        st.metric("Mean dense cytoplasm", f"{mean_dense:.2f}%")
-    with m3:
-        st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
+    # =====================================================
+    # RAW IMAGE
+    # =====================================================
+    st.subheader("Raw file image")
+    st.image(
+        rgb,
+        caption="Original uploaded liver histopathology image",
+        use_container_width=True
+    )
+
+    # =====================================================
+    # IMAGE MANIPULATION
+    # =====================================================
+    st.markdown("---")
+    st.subheader("Image manipulation")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Segmented image")
         st.image(
             overlay,
-            caption="Original image with yellow cell boundaries",
+            caption="Segmented image with yellow cell boundaries",
             use_container_width=True
         )
 
     with col2:
-        st.subheader("Threshold preview")
         st.image(
             threshold_preview,
-            caption="Grayscale preview. Red = dense/dark area based on threshold",
+            caption="Threshold preview. Red = dense/dark area",
             use_container_width=True
         )
 
+    # =====================================================
+    # SINGLE OBJECT PREVIEW
+    # =====================================================
     if not analysis_df.empty:
         st.markdown("---")
-        st.subheader("Single segmented object preview for threshold tuning")
+        st.subheader("Single segmented object for threshold tuning")
 
         object_index = st.slider(
             "Preview object index",
@@ -296,6 +305,9 @@ if uploaded is not None:
             f"Vacuolization = {selected_row['vacuolization_percent']:.2f}%"
         )
 
+    # =====================================================
+    # DENSITY PLOT
+    # =====================================================
     st.markdown("---")
     st.subheader("Density plot of vacuolization for all detected objects")
 
@@ -306,8 +318,43 @@ if uploaded is not None:
         st.pyplot(fig)
         plt.close(fig)
 
+    # =====================================================
+    # SUMMARY ANALYSIS
+    # =====================================================
     st.markdown("---")
-    st.subheader("Per-object vacuolization analysis")
+    st.subheader("Analysis summary")
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Detected objects", f"{n_objects}")
+    with m2:
+        st.metric("Mean dense cytoplasm", f"{mean_dense:.2f}%")
+    with m3:
+        st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
+
+    if not analysis_df.empty:
+        st.write("Descriptive statistics of vacuolization")
+        summary_df = pd.DataFrame({
+            "Metric": [
+                "Minimum vacuolization (%)",
+                "Maximum vacuolization (%)",
+                "Median vacuolization (%)",
+                "Standard deviation (%)"
+            ],
+            "Value": [
+                float(analysis_df["vacuolization_percent"].min()),
+                float(analysis_df["vacuolization_percent"].max()),
+                float(analysis_df["vacuolization_percent"].median()),
+                float(analysis_df["vacuolization_percent"].std()) if len(analysis_df) > 1 else 0.0
+            ]
+        })
+        st.dataframe(summary_df, use_container_width=True)
+
+    # =====================================================
+    # OBJECT TABLE
+    # =====================================================
+    st.markdown("---")
+    st.subheader("Detected object analysis")
 
     if analysis_df.empty:
         st.warning("No segmented objects detected.")
