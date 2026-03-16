@@ -8,9 +8,9 @@ from skimage import morphology, segmentation, feature, measure
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="iRATco Liver Cell Boundary", layout="wide")
-st.title("iRATco Liver Cell Boundary")
-st.caption("Upload histopathology liver image to generate hepatocyte boundaries and estimate vacuolization from bright area versus dense area in each segmented object")
+st.set_page_config(page_title="iRATco Liver Object Vacuolization", layout="wide")
+st.title("iRATco Liver Object Vacuolization")
+st.caption("Preview one segmented hepatocyte object and estimate cytoplasmic density and vacuolization")
 
 # =========================================================
 # HELPERS
@@ -49,101 +49,101 @@ def segment_hepatocytes(rgb, min_obj_size=80, peak_distance=12, blur_ksize=5):
     else:
         labeled = segmentation.watershed(-dist, markers, mask=mask)
 
-    boundaries = segmentation.find_boundaries(labeled, mode="outer")
-    return labeled, boundaries
+    labeled = measure.label(labeled > 0) if labeled.max() == 0 else labeled
+    return labeled
 
-def make_overlay(rgb, boundaries, boundary_color=(255, 255, 0)):
-    overlay = rgb.copy()
-    overlay[boundaries] = boundary_color
-    return overlay
-
-def make_threshold_preview(rgb, bright_v_thresh, bright_s_thresh, dense_v_thresh, dense_s_thresh):
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-
-    bright_mask = (
-        (hsv[:, :, 2] >= bright_v_thresh) &
-        (hsv[:, :, 1] <= bright_s_thresh)
-    )
-
-    dense_mask = (
-        (hsv[:, :, 2] <= dense_v_thresh) |
-        (hsv[:, :, 1] >= dense_s_thresh)
-    )
-
-    preview = np.zeros_like(rgb, dtype=np.uint8)
-    preview[bright_mask] = [255, 255, 255]   # bright area = white
-    preview[dense_mask] = [255, 0, 255]      # dense area = magenta
-
-    return preview, bright_mask, dense_mask
-
-def compute_bright_dense_metrics(rgb, labeled, bright_v_thresh, bright_s_thresh, dense_v_thresh, dense_s_thresh):
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
+def get_object_rows(labeled):
     props = measure.regionprops(labeled)
-    records = []
-
+    rows = []
     for prop in props:
-        label_id = int(prop.label)
-        area = int(prop.area)
-        if area <= 0:
+        if prop.area < 30:
             continue
-
         minr, minc, maxr, maxc = prop.bbox
-        obj_mask = (labeled[minr:maxr, minc:maxc] == label_id)
-
-        patch_rgb = rgb[minr:maxr, minc:maxc]
-        patch_hsv = hsv[minr:maxr, minc:maxc]
-        patch_gray = gray[minr:maxr, minc:maxc]
-
-        pix_rgb = patch_rgb[obj_mask]
-        pix_hsv = patch_hsv[obj_mask]
-        pix_gray = patch_gray[obj_mask]
-
-        if len(pix_rgb) == 0:
-            continue
-
-        bright_mask = (
-            (pix_hsv[:, 2] >= bright_v_thresh) &
-            (pix_hsv[:, 1] <= bright_s_thresh)
-        )
-
-        dense_mask = (
-            (pix_hsv[:, 2] <= dense_v_thresh) |
-            (pix_hsv[:, 1] >= dense_s_thresh)
-        )
-
-        bright_pixels = int(np.sum(bright_mask))
-        dense_pixels = int(np.sum(dense_mask))
-
-        informative_pixels = bright_pixels + dense_pixels
-        vac_index = 0.0 if informative_pixels == 0 else 100.0 * bright_pixels / informative_pixels
-
-        bright_fraction_percent = 100.0 * bright_pixels / len(pix_rgb)
-        dense_fraction_percent = 100.0 * dense_pixels / len(pix_rgb)
-
-        centroid_y, centroid_x = prop.centroid
-
-        records.append({
-            "label_id": label_id,
-            "area_px": area,
-            "centroid_x": float(centroid_x),
-            "centroid_y": float(centroid_y),
-            "total_pixels": int(len(pix_rgb)),
-            "bright_pixels": bright_pixels,
-            "dense_pixels": dense_pixels,
-            "bright_fraction_percent": float(bright_fraction_percent),
-            "dense_fraction_percent": float(dense_fraction_percent),
-            "vacuolization_index_percent": float(vac_index),
-            "mean_gray": float(np.mean(pix_gray)),
-            "mean_r": float(np.mean(pix_rgb[:, 0])),
-            "mean_g": float(np.mean(pix_rgb[:, 1])),
-            "mean_b": float(np.mean(pix_rgb[:, 2]))
+        cy, cx = prop.centroid
+        rows.append({
+            "label_id": int(prop.label),
+            "area": int(prop.area),
+            "bbox_minr": int(minr),
+            "bbox_minc": int(minc),
+            "bbox_maxr": int(maxr),
+            "bbox_maxc": int(maxc),
+            "centroid_x": float(cx),
+            "centroid_y": float(cy)
         })
+    return pd.DataFrame(rows)
 
-    df = pd.DataFrame(records)
-    mean_vac = 0.0 if df.empty else float(df["vacuolization_index_percent"].mean())
-    return df, mean_vac
+def crop_single_object(rgb, labeled, row, pad=8):
+    minr = max(0, int(row["bbox_minr"]) - pad)
+    minc = max(0, int(row["bbox_minc"]) - pad)
+    maxr = min(rgb.shape[0], int(row["bbox_maxr"]) + pad)
+    maxc = min(rgb.shape[1], int(row["bbox_maxc"]) + pad)
+
+    crop_rgb = rgb[minr:maxr, minc:maxc].copy()
+    crop_mask = (labeled[minr:maxr, minc:maxc] == int(row["label_id"]))
+
+    return crop_rgb, crop_mask
+
+def analyze_object_density_and_vacuolization(crop_rgb, crop_mask, sat_thresh, val_thresh, red_ratio_thresh):
+    """
+    Dense cytoplasm = piksel dalam object mask yang cukup berwarna eosin / cukup padat:
+    - saturation >= sat_thresh
+    - value <= val_thresh   (tidak terlalu pucat)
+    - red channel relatif dominan terhadap green/blue
+
+    Vacuolization = area object yang tidak termasuk dense threshold
+    """
+    hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
+
+    pix_hsv = hsv[crop_mask]
+    pix_rgb = crop_rgb[crop_mask]
+
+    if len(pix_rgb) == 0:
+        return None
+
+    r = pix_rgb[:, 0].astype(np.float32)
+    g = pix_rgb[:, 1].astype(np.float32)
+    b = pix_rgb[:, 2].astype(np.float32)
+
+    dense_mask_flat = (
+        (pix_hsv[:, 1] >= sat_thresh) &
+        (pix_hsv[:, 2] <= val_thresh) &
+        (r >= g * red_ratio_thresh) &
+        (r >= b * red_ratio_thresh)
+    )
+
+    total_area = int(np.sum(crop_mask))
+    dense_area = int(np.sum(dense_mask_flat))
+    vacuolated_area = int(total_area - dense_area)
+
+    dense_percent = 100.0 * dense_area / total_area if total_area > 0 else 0.0
+    vac_percent = 100.0 * vacuolated_area / total_area if total_area > 0 else 0.0
+
+    # rebuild dense mask to image shape
+    dense_mask_img = np.zeros(crop_mask.shape, dtype=bool)
+    dense_mask_img[crop_mask] = dense_mask_flat
+
+    # white bg version
+    object_only = np.ones_like(crop_rgb, dtype=np.uint8) * 255
+    object_only[crop_mask] = crop_rgb[crop_mask]
+
+    overlay = object_only.copy()
+    overlay[dense_mask_img] = [255, 0, 0]  # merah = dense cytoplasm
+
+    # outline object
+    boundary = segmentation.find_boundaries(crop_mask, mode="outer")
+    overlay[boundary] = [255, 255, 0]
+    object_only[boundary] = [255, 255, 0]
+
+    return {
+        "object_only": object_only,
+        "overlay": overlay,
+        "dense_mask_img": dense_mask_img,
+        "total_area": total_area,
+        "dense_area": dense_area,
+        "vacuolated_area": vacuolated_area,
+        "dense_percent": dense_percent,
+        "vacuolization_percent": vac_percent
+    }
 
 # =========================================================
 # SIDEBAR
@@ -155,14 +155,10 @@ with st.sidebar:
     blur_ksize = st.slider("Gaussian blur kernel", 3, 11, 5, 2)
 
     st.markdown("---")
-    st.header("Bright area settings")
-    bright_v_thresh = st.slider("Bright threshold V", 120, 255, 185, 5)
-    bright_s_thresh = st.slider("Bright threshold S", 0, 180, 95, 5)
-
-    st.markdown("---")
-    st.header("Dense area settings")
-    dense_v_thresh = st.slider("Dense threshold V", 0, 180, 145, 5)
-    dense_s_thresh = st.slider("Dense threshold S", 20, 255, 120, 5)
+    st.header("Dense cytoplasm threshold")
+    sat_thresh = st.slider("Minimum saturation (S)", 20, 255, 90, 5)
+    val_thresh = st.slider("Maximum brightness (V)", 80, 255, 210, 5)
+    red_ratio_thresh = st.slider("Red dominance ratio", 1.00, 1.50, 1.08, 0.01)
 
 # =========================================================
 # UPLOAD
@@ -174,93 +170,81 @@ uploaded = st.file_uploader(
 
 if uploaded is not None:
     rgb = pil_to_rgb_array(Image.open(uploaded))
-
-    labeled, boundaries = segment_hepatocytes(
+    labeled = segment_hepatocytes(
         rgb,
         min_obj_size=min_obj_size,
         peak_distance=peak_distance,
         blur_ksize=blur_ksize
     )
 
-    overlay = make_overlay(rgb, boundaries, boundary_color=(255, 255, 0))
+    objects_df = get_object_rows(labeled)
 
-    threshold_preview, bright_mask_full, dense_mask_full = make_threshold_preview(
-        rgb,
-        bright_v_thresh=bright_v_thresh,
-        bright_s_thresh=bright_s_thresh,
-        dense_v_thresh=dense_v_thresh,
-        dense_s_thresh=dense_s_thresh
-    )
-
-    analysis_df, mean_vacuolization = compute_bright_dense_metrics(
-        rgb=rgb,
-        labeled=labeled,
-        bright_v_thresh=bright_v_thresh,
-        bright_s_thresh=bright_s_thresh,
-        dense_v_thresh=dense_v_thresh,
-        dense_s_thresh=dense_s_thresh
-    )
-
-    n_objects = int(labeled.max())
-    mean_dense = 0.0 if analysis_df.empty else float(analysis_df["dense_fraction_percent"].mean())
-    mean_bright = 0.0 if analysis_df.empty else float(analysis_df["bright_fraction_percent"].mean())
-
-    st.success(f"Detected segmented objects: {n_objects}")
-
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("Detected objects", f"{n_objects}")
-    with m2:
-        st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
-    with m3:
-        st.metric("Mean bright area", f"{mean_bright:.2f}%")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Threshold image")
-        st.image(
-            threshold_preview,
-            caption="White = bright area, magenta = dense area",
-            use_container_width=True
-        )
-
-    with col2:
-        st.subheader("Segmented image")
-        st.image(
-            overlay,
-            caption="Overlay on original (yellow boundaries)",
-            use_container_width=True
-        )
-
-    st.markdown("---")
-    st.subheader("Per-object bright and dense area analysis")
-
-    if analysis_df.empty:
-        st.warning("No segmented objects detected.")
+    if objects_df.empty:
+        st.warning("No objects detected.")
     else:
-        st.dataframe(
-            analysis_df[[
-                "label_id",
-                "area_px",
-                "bright_pixels",
-                "dense_pixels",
-                "bright_fraction_percent",
-                "dense_fraction_percent",
-                "vacuolization_index_percent",
-                "centroid_x",
-                "centroid_y"
-            ]],
-            use_container_width=True
+        st.success(f"Detected segmented objects: {len(objects_df)}")
+
+        object_idx = st.slider(
+            "Select detected object",
+            min_value=0,
+            max_value=len(objects_df) - 1,
+            value=0,
+            step=1
         )
 
-        csv = analysis_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download vacuolization CSV",
-            data=csv,
-            file_name="liver_bright_dense_vacuolization.csv",
-            mime="text/csv"
+        row = objects_df.iloc[object_idx]
+        crop_rgb, crop_mask = crop_single_object(rgb, labeled, row, pad=10)
+
+        result = analyze_object_density_and_vacuolization(
+            crop_rgb=crop_rgb,
+            crop_mask=crop_mask,
+            sat_thresh=sat_thresh,
+            val_thresh=val_thresh,
+            red_ratio_thresh=red_ratio_thresh
         )
+
+        if result is None:
+            st.warning("Selected object could not be analyzed.")
+        else:
+            st.markdown("### Selected object analysis")
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Label ID", int(row["label_id"]))
+            with m2:
+                st.metric("Total cytoplasm area", int(result["total_area"]))
+            with m3:
+                st.metric("Dense cytoplasm", f"{result['dense_percent']:.2f}%")
+            with m4:
+                st.metric("Vacuolization", f"{result['vacuolization_percent']:.2f}%")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Single detected object")
+                st.image(result["object_only"], use_container_width=True)
+
+            with col2:
+                st.subheader("Threshold overlay")
+                st.image(
+                    result["overlay"],
+                    caption="Red = dense cytoplasm, Yellow = object boundary",
+                    use_container_width=True
+                )
+
+            st.markdown("---")
+            st.subheader("Object data")
+
+            out_df = pd.DataFrame([{
+                "label_id": int(row["label_id"]),
+                "total_cytoplasm_area": int(result["total_area"]),
+                "dense_area": int(result["dense_area"]),
+                "vacuolated_area": int(result["vacuolated_area"]),
+                "dense_percent": float(result["dense_percent"]),
+                "vacuolization_percent": float(result["vacuolization_percent"])
+            }])
+
+            st.dataframe(out_df, use_container_width=True)
 
 else:
     st.info("Please upload a liver histopathology image first.")
