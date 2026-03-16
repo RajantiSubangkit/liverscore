@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from skimage import morphology, segmentation, feature, measure
+import matplotlib.pyplot as plt
 
 # =========================================================
 # PAGE CONFIG
@@ -59,13 +60,11 @@ def make_overlay(rgb, boundaries, boundary_color=(255, 255, 0)):
 
 def make_gray_threshold_preview(rgb, gray_threshold):
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    # gelap = dense
     dense_mask = gray <= gray_threshold
 
     preview = np.stack([gray, gray, gray], axis=-1)
     preview = preview.copy()
-    preview[dense_mask] = [255, 0, 0]  # merah = dense / gelap
+    preview[dense_mask] = [255, 0, 0]
     return gray, dense_mask, preview
 
 def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
@@ -82,7 +81,6 @@ def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
 
         minr, minc, maxr, maxc = prop.bbox
         obj_mask = (labeled[minr:maxr, minc:maxc] == label_id)
-
         patch_gray = gray[minr:maxr, minc:maxc]
         pix_gray = patch_gray[obj_mask]
 
@@ -103,9 +101,13 @@ def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
         records.append({
             "label_id": label_id,
             "area_px": area,
+            "mean_gray": float(np.mean(pix_gray)),
             "centroid_x": float(centroid_x),
             "centroid_y": float(centroid_y),
-            "mean_gray": float(np.mean(pix_gray)),
+            "bbox_minr": int(minr),
+            "bbox_minc": int(minc),
+            "bbox_maxr": int(maxr),
+            "bbox_maxc": int(maxc),
             "dense_area_px": dense_area,
             "non_dense_area_px": vacuolated_area,
             "dense_percent": float(dense_percent),
@@ -117,6 +119,61 @@ def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
     mean_dense = 0.0 if df.empty else float(df["dense_percent"].mean())
 
     return df, mean_vacuolization, mean_dense
+
+def crop_single_segmented_object(rgb, labeled, row, gray_threshold, pad=10):
+    minr = max(0, int(row["bbox_minr"]) - pad)
+    minc = max(0, int(row["bbox_minc"]) - pad)
+    maxr = min(rgb.shape[0], int(row["bbox_maxr"]) + pad)
+    maxc = min(rgb.shape[1], int(row["bbox_maxc"]) + pad)
+
+    crop_rgb = rgb[minr:maxr, minc:maxc].copy()
+    crop_gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    crop_obj_mask = (labeled[minr:maxr, minc:maxc] == int(row["label_id"]))
+
+    object_preview = np.ones_like(crop_rgb, dtype=np.uint8) * 255
+    object_preview[crop_obj_mask] = crop_rgb[crop_obj_mask]
+
+    threshold_preview = np.stack([crop_gray, crop_gray, crop_gray], axis=-1)
+    threshold_preview[~crop_obj_mask] = [255, 255, 255]
+
+    dense_mask = (crop_gray <= gray_threshold) & crop_obj_mask
+    threshold_preview[dense_mask] = [255, 0, 0]
+
+    boundary = segmentation.find_boundaries(crop_obj_mask, mode="outer")
+    object_preview[boundary] = [255, 255, 0]
+    threshold_preview[boundary] = [255, 255, 0]
+
+    return object_preview, threshold_preview
+
+def make_density_plot(values):
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.set_axis_off()
+        return fig
+
+    ax.hist(values, bins=25, density=True, alpha=0.35)
+
+    if len(values) > 1 and np.std(values) > 0:
+        xs = np.linspace(0, 100, 400)
+        bw = max(np.std(values) * 0.25, 1.0)
+        density = np.zeros_like(xs)
+
+        for v in values:
+            density += np.exp(-0.5 * ((xs - v) / bw) ** 2)
+
+        density /= (len(values) * bw * np.sqrt(2 * np.pi))
+        ax.plot(xs, density, linewidth=2)
+
+    ax.set_title("Density plot of vacuolization (%)")
+    ax.set_xlabel("Vacuolization (%)")
+    ax.set_ylabel("Density")
+    ax.set_xlim(0, 100)
+    return fig
 
 # =========================================================
 # SIDEBAR
@@ -197,6 +254,57 @@ if uploaded is not None:
             caption="Grayscale preview. Red = dense/dark area based on threshold",
             use_container_width=True
         )
+
+    if not analysis_df.empty:
+        st.markdown("---")
+        st.subheader("Single segmented object preview for threshold tuning")
+
+        object_index = st.slider(
+            "Preview object index",
+            min_value=0,
+            max_value=len(analysis_df) - 1,
+            value=0,
+            step=1
+        )
+
+        selected_row = analysis_df.iloc[object_index]
+        obj_img, obj_thresh = crop_single_segmented_object(
+            rgb=rgb,
+            labeled=labeled,
+            row=selected_row,
+            gray_threshold=gray_threshold,
+            pad=10
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.image(
+                obj_img,
+                caption=f"Segmented object ID {int(selected_row['label_id'])}",
+                use_container_width=True
+            )
+        with c2:
+            st.image(
+                obj_thresh,
+                caption="Threshold preview for selected object",
+                use_container_width=True
+            )
+
+        st.caption(
+            f"Object ID {int(selected_row['label_id'])} | "
+            f"Dense = {selected_row['dense_percent']:.2f}% | "
+            f"Vacuolization = {selected_row['vacuolization_percent']:.2f}%"
+        )
+
+    st.markdown("---")
+    st.subheader("Density plot of vacuolization for all detected objects")
+
+    if analysis_df.empty:
+        st.warning("No segmented objects detected.")
+    else:
+        fig = make_density_plot(analysis_df["vacuolization_percent"].values)
+        st.pyplot(fig)
+        plt.close(fig)
 
     st.markdown("---")
     st.subheader("Per-object vacuolization analysis")
