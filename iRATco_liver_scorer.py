@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="iRATco Liver Vacuolization Measure", layout="wide")
-st.title("iRATco Liver Vacuolization Measure")
+st.set_page_config(page_title="Hepatic Vacuolization Quantifier", layout="wide")
+st.title("Hepatic Vacuolization Quantifier")
 st.caption("Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold")
 
 # =========================================================
@@ -350,8 +350,9 @@ else:
 
 st.markdown("---")
 st.caption("""
-Prototype version...
-Developed by: © 2026, **Mawar Subangkit**  
+Developed by: © 2026, **Mawar Subangkit** 
+
+Sponsored by **iRATco Laboratory**
 
 If you use this software, please cite:  
 Subangkit, M. 2026. **iRATco Liver Vacuolization. Streamlit-based software for hepatocyte segmentation and vacuolization analysis.**
