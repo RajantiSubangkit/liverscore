@@ -9,8 +9,19 @@ import matplotlib.pyplot as plt
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="Hepatic Vacuolization Quantifier", layout="wide")
-st.title("Hepatic Vacuolization Quantifier")
+st.set_page_config(
+    page_title="iRATco Hepatic Vacuolization Quantifier",
+    page_icon="logo.png",
+    layout="wide"
+)
+
+# HEADER
+col1, col2 = st.columns([8, 2])
+with col1:
+    st.title("iRATco Hepatic Vacuolization Quantifier")
+    st.markdown("<span style='font-size:16px;color:gray;'>version 1.1.0</span>", unsafe_allow_html=True)
+with col2:
+    st.image("logo_iratco.png", width=250)
 st.caption("Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold")
 
 # =========================================================
