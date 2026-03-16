@@ -58,13 +58,19 @@ def make_overlay(rgb, boundaries, boundary_color=(255, 255, 0)):
     overlay[boundaries] = boundary_color
     return overlay
 
-def make_gray_threshold_preview(rgb, gray_threshold):
+def make_gray_threshold_preview(rgb, labeled, gray_threshold):
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     dense_mask = gray <= gray_threshold
 
     preview = np.stack([gray, gray, gray], axis=-1)
     preview = preview.copy()
-    preview[dense_mask] = [255, 0, 0]
+
+    object_mask = labeled > 0
+    dense_object_mask = dense_mask & object_mask
+
+    preview[dense_object_mask] = [255, 0, 0]
+    preview[~object_mask] = [255, 255, 255]
+
     return gray, dense_mask, preview
 
 def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
@@ -216,6 +222,7 @@ if uploaded is not None:
     overlay = make_overlay(rgb, boundaries, boundary_color=(255, 255, 0))
     gray_img, dense_mask_full, threshold_preview = make_gray_threshold_preview(
         rgb,
+        labeled,
         gray_threshold=gray_threshold
     )
 
@@ -230,34 +237,31 @@ if uploaded is not None:
     st.success(f"Detected segmented objects: {n_objects}")
 
     # =====================================================
-    # RAW IMAGE
+    # THREE IMAGES IN ONE ROW
     # =====================================================
-    st.subheader("Raw file image")
-    st.image(
-        rgb,
-        caption="Original uploaded liver histopathology image",
-        use_container_width=True
-    )
+    c1, c2, c3 = st.columns(3)
 
-    # =====================================================
-    # IMAGE MANIPULATION
-    # =====================================================
-    st.markdown("---")
-    st.subheader("Image manipulation")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
+    with c1:
+        st.subheader("Raw file")
         st.image(
-            overlay,
-            caption="Segmented image with yellow cell boundaries",
+            rgb,
+            caption="Original image",
             use_container_width=True
         )
 
-    with col2:
+    with c2:
+        st.subheader("Segmented image")
+        st.image(
+            overlay,
+            caption="Yellow boundaries",
+            use_container_width=True
+        )
+
+    with c3:
+        st.subheader("Threshold preview")
         st.image(
             threshold_preview,
-            caption="Threshold preview. Red = dense/dark area",
+            caption="Red = dense/dark area",
             use_container_width=True
         )
 
@@ -285,14 +289,14 @@ if uploaded is not None:
             pad=10
         )
 
-        c1, c2 = st.columns(2)
-        with c1:
+        s1, s2 = st.columns(2)
+        with s1:
             st.image(
                 obj_img,
                 caption=f"Segmented object ID {int(selected_row['label_id'])}",
                 use_container_width=True
             )
-        with c2:
+        with s2:
             st.image(
                 obj_thresh,
                 caption="Threshold preview for selected object",
@@ -309,7 +313,7 @@ if uploaded is not None:
     # DENSITY PLOT
     # =====================================================
     st.markdown("---")
-    st.subheader("Density plot of vacuolization for all detected objects")
+    st.subheader("Density plot")
 
     if analysis_df.empty:
         st.warning("No segmented objects detected.")
@@ -319,10 +323,10 @@ if uploaded is not None:
         plt.close(fig)
 
     # =====================================================
-    # SUMMARY ANALYSIS
+    # ANALYSIS SUMMARY
     # =====================================================
     st.markdown("---")
-    st.subheader("Analysis summary")
+    st.subheader("Analysis")
 
     m1, m2, m3 = st.columns(3)
     with m1:
@@ -333,28 +337,22 @@ if uploaded is not None:
         st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
 
     if not analysis_df.empty:
-        st.write("Descriptive statistics of vacuolization")
-        summary_df = pd.DataFrame({
-            "Metric": [
-                "Minimum vacuolization (%)",
-                "Maximum vacuolization (%)",
-                "Median vacuolization (%)",
-                "Standard deviation (%)"
-            ],
-            "Value": [
-                float(analysis_df["vacuolization_percent"].min()),
-                float(analysis_df["vacuolization_percent"].max()),
-                float(analysis_df["vacuolization_percent"].median()),
-                float(analysis_df["vacuolization_percent"].std()) if len(analysis_df) > 1 else 0.0
-            ]
-        })
-        st.dataframe(summary_df, use_container_width=True)
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.metric("Min vacuolization", f"{analysis_df['vacuolization_percent'].min():.2f}%")
+        with s2:
+            st.metric("Median vacuolization", f"{analysis_df['vacuolization_percent'].median():.2f}%")
+        with s3:
+            st.metric("Max vacuolization", f"{analysis_df['vacuolization_percent'].max():.2f}%")
+        with s4:
+            std_val = analysis_df["vacuolization_percent"].std() if len(analysis_df) > 1 else 0.0
+            st.metric("SD vacuolization", f"{std_val:.2f}")
 
     # =====================================================
     # OBJECT TABLE
     # =====================================================
     st.markdown("---")
-    st.subheader("Detected object analysis")
+    st.subheader("Detected object table")
 
     if analysis_df.empty:
         st.warning("No segmented objects detected.")
