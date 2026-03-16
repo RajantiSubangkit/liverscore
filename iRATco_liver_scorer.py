@@ -350,8 +350,9 @@ else:
 
 st.markdown("---")
 st.caption("""
+Prototype version...
 Developed by: © 2026, **Mawar Subangkit**  
 
 If you use this software, please cite:  
-**Subangkit M. iRATco Liver Vacuolization. Streamlit-based software for hepatocyte segmentation and vacuolization analysis.**
+Subangkit, M. 2026. **iRATco Liver Vacuolization. Streamlit-based software for hepatocyte segmentation and vacuolization analysis.**
 """)
