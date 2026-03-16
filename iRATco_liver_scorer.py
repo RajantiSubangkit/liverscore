@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="iRATco Liver Vacuolization", layout="wide")
-st.title("iRATco Liver Vacuolization")
-st.caption("Segment hepatocyte-like objects and estimate vacuolization from grayscale dark-versus-light cytoplasmic threshold")
+st.set_page_config(page_title="iRATco Liver Vacuolization Measure", layout="wide")
+st.title("iRATco Liver Vacuolization Measure")
+st.caption("Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold")
 
 # =========================================================
 # HELPERS
@@ -347,3 +347,6 @@ if uploaded is not None:
 
 else:
     st.info("Please upload a liver histopathology image first.")
+
+st.markdown("---")
+st.caption("Prototype: Developed: (c) 2026 Mawar Subangkit.")
