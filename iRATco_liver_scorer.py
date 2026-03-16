@@ -62,8 +62,7 @@ def make_gray_threshold_preview(rgb, labeled, gray_threshold):
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     dense_mask = gray <= gray_threshold
 
-    preview = np.stack([gray, gray, gray], axis=-1)
-    preview = preview.copy()
+    preview = np.stack([gray, gray, gray], axis=-1).copy()
 
     object_mask = labeled > 0
     dense_object_mask = dense_mask & object_mask
@@ -101,13 +100,14 @@ def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
 
         dense_percent = 100.0 * dense_area / total_area if total_area > 0 else 0.0
         vac_percent = 100.0 * vacuolated_area / total_area if total_area > 0 else 0.0
+        mean_gray = float(np.mean(pix_gray))
 
         centroid_y, centroid_x = prop.centroid
 
         records.append({
             "label_id": label_id,
             "area_px": area,
-            "mean_gray": float(np.mean(pix_gray)),
+            "mean_gray": mean_gray,
             "centroid_x": float(centroid_x),
             "centroid_y": float(centroid_y),
             "bbox_minr": int(minr),
@@ -121,10 +121,11 @@ def compute_object_vacuolization_from_gray(rgb, labeled, gray_threshold):
         })
 
     df = pd.DataFrame(records)
-    mean_vacuolization = 0.0 if df.empty else float(df["vacuolization_percent"].mean())
-    mean_dense = 0.0 if df.empty else float(df["dense_percent"].mean())
 
-    return df, mean_vacuolization, mean_dense
+    mean_vacuolization = 0.0 if df.empty else float(df["vacuolization_percent"].mean())
+    mean_intensity = 0.0 if df.empty else float(df["mean_gray"].mean())
+
+    return df, mean_vacuolization, mean_intensity
 
 def crop_single_segmented_object(rgb, labeled, row, gray_threshold, pad=10):
     minr = max(0, int(row["bbox_minr"]) - pad)
@@ -226,7 +227,7 @@ if uploaded is not None:
         gray_threshold=gray_threshold
     )
 
-    analysis_df, mean_vacuolization, mean_dense = compute_object_vacuolization_from_gray(
+    analysis_df, mean_vacuolization, mean_intensity = compute_object_vacuolization_from_gray(
         rgb=rgb,
         labeled=labeled,
         gray_threshold=gray_threshold
@@ -305,7 +306,7 @@ if uploaded is not None:
 
         st.caption(
             f"Object ID {int(selected_row['label_id'])} | "
-            f"Dense = {selected_row['dense_percent']:.2f}% | "
+            f"Mean intensity = {selected_row['mean_gray']:.2f} gray units | "
             f"Vacuolization = {selected_row['vacuolization_percent']:.2f}%"
         )
 
@@ -323,7 +324,7 @@ if uploaded is not None:
         plt.close(fig)
 
     # =====================================================
-    # ANALYSIS SUMMARY
+    # ANALYSIS
     # =====================================================
     st.markdown("---")
     st.subheader("Analysis")
@@ -332,53 +333,17 @@ if uploaded is not None:
     with m1:
         st.metric("Detected objects", f"{n_objects}")
     with m2:
-        st.metric("Mean dense cytoplasm", f"{mean_dense:.2f}%")
+        st.metric("Mean intensity", f"{mean_intensity:.2f}")
     with m3:
         st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
 
-    if not analysis_df.empty:
-        s1, s2, s3, s4 = st.columns(4)
-        with s1:
-            st.metric("Min vacuolization", f"{analysis_df['vacuolization_percent'].min():.2f}%")
-        with s2:
-            st.metric("Median vacuolization", f"{analysis_df['vacuolization_percent'].median():.2f}%")
-        with s3:
-            st.metric("Max vacuolization", f"{analysis_df['vacuolization_percent'].max():.2f}%")
-        with s4:
-            std_val = analysis_df["vacuolization_percent"].std() if len(analysis_df) > 1 else 0.0
-            st.metric("SD vacuolization", f"{std_val:.2f}")
-
-    # =====================================================
-    # OBJECT TABLE
-    # =====================================================
-    st.markdown("---")
-    st.subheader("Detected object table")
-
-    if analysis_df.empty:
-        st.warning("No segmented objects detected.")
-    else:
-        st.dataframe(
-            analysis_df[[
-                "label_id",
-                "area_px",
-                "mean_gray",
-                "dense_area_px",
-                "non_dense_area_px",
-                "dense_percent",
-                "vacuolization_percent",
-                "centroid_x",
-                "centroid_y"
-            ]],
-            use_container_width=True
-        )
-
-        csv = analysis_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download vacuolization CSV",
-            data=csv,
-            file_name="liver_gray_threshold_vacuolization.csv",
-            mime="text/csv"
-        )
+    csv = analysis_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download vacuolization CSV",
+        data=csv,
+        file_name="liver_gray_threshold_vacuolization.csv",
+        mime="text/csv"
+    )
 
 else:
     st.info("Please upload a liver histopathology image first.")
