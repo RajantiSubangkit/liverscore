@@ -349,7 +349,7 @@ else:
     st.info("Please upload a liver histopathology image first.")
 
 st.markdown("---")
-    st.caption("Prototype version. Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold.
+st.caption("Prototype version. Segment hepatocyte-like objects and estimate vacuolization from grayscale threshold.
 
     © 2026 Mawar Subangkit
 
