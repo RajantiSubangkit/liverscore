@@ -57,6 +57,25 @@ def make_overlay(rgb, boundaries, boundary_color=(255, 255, 0)):
     overlay[boundaries] = boundary_color
     return overlay
 
+def make_threshold_preview(rgb, bright_v_thresh, bright_s_thresh, dense_v_thresh, dense_s_thresh):
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+
+    bright_mask = (
+        (hsv[:, :, 2] >= bright_v_thresh) &
+        (hsv[:, :, 1] <= bright_s_thresh)
+    )
+
+    dense_mask = (
+        (hsv[:, :, 2] <= dense_v_thresh) |
+        (hsv[:, :, 1] >= dense_s_thresh)
+    )
+
+    preview = np.zeros_like(rgb, dtype=np.uint8)
+    preview[bright_mask] = [255, 255, 255]   # bright area = white
+    preview[dense_mask] = [255, 0, 255]      # dense area = magenta
+
+    return preview, bright_mask, dense_mask
+
 def compute_bright_dense_metrics(rgb, labeled, bright_v_thresh, bright_s_thresh, dense_v_thresh, dense_s_thresh):
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -84,13 +103,11 @@ def compute_bright_dense_metrics(rgb, labeled, bright_v_thresh, bright_s_thresh,
         if len(pix_rgb) == 0:
             continue
 
-        # Bright area: terang dan relatif kurang jenuh
         bright_mask = (
             (pix_hsv[:, 2] >= bright_v_thresh) &
             (pix_hsv[:, 1] <= bright_s_thresh)
         )
 
-        # Dense area: lebih gelap / lebih padat warnanya
         dense_mask = (
             (pix_hsv[:, 2] <= dense_v_thresh) |
             (pix_hsv[:, 1] >= dense_s_thresh)
@@ -100,10 +117,7 @@ def compute_bright_dense_metrics(rgb, labeled, bright_v_thresh, bright_s_thresh,
         dense_pixels = int(np.sum(dense_mask))
 
         informative_pixels = bright_pixels + dense_pixels
-        if informative_pixels == 0:
-            vac_index = 0.0
-        else:
-            vac_index = 100.0 * bright_pixels / informative_pixels
+        vac_index = 0.0 if informative_pixels == 0 else 100.0 * bright_pixels / informative_pixels
 
         bright_fraction_percent = 100.0 * bright_pixels / len(pix_rgb)
         dense_fraction_percent = 100.0 * dense_pixels / len(pix_rgb)
@@ -169,7 +183,14 @@ if uploaded is not None:
     )
 
     overlay = make_overlay(rgb, boundaries, boundary_color=(255, 255, 0))
-    n_objects = int(labeled.max())
+
+    threshold_preview, bright_mask_full, dense_mask_full = make_threshold_preview(
+        rgb,
+        bright_v_thresh=bright_v_thresh,
+        bright_s_thresh=bright_s_thresh,
+        dense_v_thresh=dense_v_thresh,
+        dense_s_thresh=dense_s_thresh
+    )
 
     analysis_df, mean_vacuolization = compute_bright_dense_metrics(
         rgb=rgb,
@@ -180,6 +201,10 @@ if uploaded is not None:
         dense_s_thresh=dense_s_thresh
     )
 
+    n_objects = int(labeled.max())
+    mean_dense = 0.0 if analysis_df.empty else float(analysis_df["dense_fraction_percent"].mean())
+    mean_bright = 0.0 if analysis_df.empty else float(analysis_df["bright_fraction_percent"].mean())
+
     st.success(f"Detected segmented objects: {n_objects}")
 
     m1, m2, m3 = st.columns(3)
@@ -188,14 +213,25 @@ if uploaded is not None:
     with m2:
         st.metric("Mean vacuolization total", f"{mean_vacuolization:.2f}%")
     with m3:
-        mean_dense = 0.0 if analysis_df.empty else float(analysis_df["dense_fraction_percent"].mean())
-        st.metric("Mean dense area", f"{mean_dense:.2f}%")
+        st.metric("Mean bright area", f"{mean_bright:.2f}%")
 
-    st.image(
-        overlay,
-        caption="Overlay on original (yellow boundaries)",
-        use_container_width=True
-    )
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Threshold image")
+        st.image(
+            threshold_preview,
+            caption="White = bright area, magenta = dense area",
+            use_container_width=True
+        )
+
+    with col2:
+        st.subheader("Segmented image")
+        st.image(
+            overlay,
+            caption="Overlay on original (yellow boundaries)",
+            use_container_width=True
+        )
 
     st.markdown("---")
     st.subheader("Per-object bright and dense area analysis")
